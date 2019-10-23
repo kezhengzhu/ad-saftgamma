@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd 
 import time
 from math import pi,tanh,log10
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import sys
 from scipy.optimize import fsolve, least_squares
 
@@ -100,6 +100,7 @@ class System(object):
             fn = self.helmholtz()
 
         da = derivative(fn, self.volume)
+        da = da / cst.nmtom**3
         self.volume = V
         
         return da
@@ -137,6 +138,8 @@ class System(object):
             fn = self.helmholtz()
 
         da, d2a = derivative(fn, self.volume, order=2)
+        da = da / cst.nmtom**3
+        d2a = d2a / cst.nmtom**6
         self.volume = V
         
         Var.set_order(1)
@@ -157,7 +160,10 @@ class System(object):
         else:
             fn = self.helmholtz()
 
-        da, d2a = derivative(fn, self.volume, self.temperature, order=2)
+        da, d2a = derivative(fn, self.temperature, self.volume, order=2)
+        da[1] = da[1] / cst.nmtom**3
+        d2a[1] = d2a[1] / cst.nmtom**3
+        d2a[2] = d2a[2] / cst.nmtom**6
         self.volume = V
         self.temperature = T
 
@@ -219,10 +225,98 @@ class System(object):
         self.volume = volume
 
         dArdV = self.dV(a='res')
-        P = (self.n_molecules / volume * cst.k * temperature - dArdV) / pow(cst.nmtom,3)
-        self.volume = volume
+        P = (self.n_molecules / (volume * cst.nmtom**3) * cst.k * temperature - dArdV)
 
         return P
+    
+    def get_entropy(self, temperature=None, volume=None, molar_volume=None):
+        '''
+        Calculates entropy in units J/mol K
+        where entropy = -dA/dT
+        '''
+        if temperature == None or (not isinstance(temperature, (int, float))):
+            temperature = self.temperature
+        if molar_volume != None and isinstance(molar_volume, (int, float)):
+            volume = self.set_molar_volume(molar_volume)
+        elif volume == None or (not isinstance(volume, (int, float))):
+            volume = self.volume
+
+        self.temperature = temperature
+        self.volume = volume
+
+        dAdT = self.dT()
+        s = -dAdT * cst.Na / self.n_molecules
+
+        return s
+
+    def get_u(self, temperature=None, volume=None, molar_volume=None):
+        '''
+        Calculates internal energy in units J/mol
+        where u = A + TS
+        '''
+        if temperature == None or (not isinstance(temperature, (int, float))):
+            temperature = self.temperature
+        if molar_volume != None and isinstance(molar_volume, (int, float)):
+            volume = self.set_molar_volume(molar_volume)
+        elif volume == None or (not isinstance(volume, (int, float))):
+            volume = self.volume
+
+        self.temperature = temperature
+        self.volume = volume
+
+        A = self.helmholtz()
+        dAdT = self.dT()
+        s = -dAdT
+        u = (A + temperature * s) * cst.Na / self.n_molecules
+
+        return u
+
+    def get_enthalpy(self, temperature=None, volume=None, molar_volume=None):
+        '''
+        Calculates enthalpy in units J/mol
+        where H = A + TS + PV
+        '''
+        if temperature == None or (not isinstance(temperature, (int, float))):
+            temperature = self.temperature
+        if molar_volume != None and isinstance(molar_volume, (int, float)):
+            volume = self.set_molar_volume(molar_volume)
+        elif volume == None or (not isinstance(volume, (int, float))):
+            volume = self.volume
+
+        self.temperature = temperature
+        self.volume = volume
+
+        A = self.helmholtz()
+        dAdT = self.dT()
+        dAdV = self.dV()
+        s = -dAdT
+        P = -dAdV
+        h = (A + temperature * s + P * volume * cst.nmtom**3) * cst.Na / self.n_molecules
+
+        return h
+
+    def get_gibbs(self, temperature=None, volume=None, molar_volume=None):
+        '''
+        Calculates gibbs free energy in units J/mol
+        where gibbs = A + PV
+        '''
+        if temperature == None or (not isinstance(temperature, (int, float))):
+            temperature = self.temperature
+        if molar_volume != None and isinstance(molar_volume, (int, float)):
+            volume = self.set_molar_volume(molar_volume)
+        elif volume == None or (not isinstance(volume, (int, float))):
+            volume = self.volume
+
+        self.temperature = temperature
+        self.volume = volume
+
+        A = self.helmholtz()
+        dAdV = self.dV()
+
+        P = -dAdV
+        g = (A + P * volume * cst.nmtom**3) * cst.Na / self.n_molecules
+
+        return g
 
     def get_cv(self, temperature=None, volume=None, molar_volume=None):
         '''
@@ -260,9 +354,10 @@ class System(object):
         self.volume = volume
 
         d2adv2 = self.dV2(a='res')
+        v = volume * cst.nmtom**3
 
-        dpdv = -self.n_molecules * cst.k * temperature / pow(volume * cst.nmtom**3, 2) - d2adv2
-        kappa = -1 / (volume * cst.nmtom**3 * dpdv)
+        dpdv = -self.n_molecules * cst.k * temperature / pow(v, 2) - d2adv2
+        kappa = -1 / (v * dpdv)
         return kappa
 
     def get_cp(self, temperature=None, volume=None, molar_volume=None):
@@ -280,21 +375,105 @@ class System(object):
         self.temperature = temperature
         self.volume = volume
 
-
+        d2r = self.dTdV(a='res')
+        dt2_id = self.dT2(a='id')
+        dTdV_r = d2r[1]
+        dV2_r = d2r[2]
+        dT2 = dt2_id + d2r[0]
 
         T = temperature
-        V = volume
+        V = volume * cst.nmtom**3
         N = self.n_molecules
         k = cst.k
 
-        dhdt_v = -T * dT2 + N*k - V * dVdT_r
-        dhdv_t = -T * 1
-        dpdt_v = 0
-        dpdv_t = 0
+        dhdt_v = -T * dT2 + N*k - V * dTdV_r
+        dhdv_t = -T * dTdV_r - V * dV2_r
+        dpdt_v = N*k/V - dTdV_r
+        dpdv_t = -N*k*T/V**2 - dV2_r
 
         cp = dhdt_v - dhdv_t * dpdt_v / dpdv_t
+        cp = cp / N * cst.Na
         return cp
 
+    def get_w(self, temperature=None, volume=None, molar_volume=None):
+        '''
+        Calculates speed of sound in units m/s
+        where w = sqrt(dP/drho) where rho is in kg/m3
+        '''
+        if temperature == None or (not isinstance(temperature, (int, float))):
+            temperature = self.temperature
+        if molar_volume != None and isinstance(molar_volume, (int, float)):
+            volume = self.set_molar_volume(molar_volume)
+        elif volume == None or (not isinstance(volume, (int, float))):
+            volume = self.volume
+
+        self.temperature = temperature
+        self.volume = volume
+
+        d2r = self.dTdV(a='res')
+        dt2_id = self.dT2(a='id')
+        dTdV_r = d2r[1]
+        dV2_r = d2r[2]
+        dT2 = dt2_id + d2r[0]
+
+        T = temperature
+        V = volume * cst.nmtom**3
+        N = self.n_molecules
+        k = cst.k
+
+        dsdt_v = -dT2
+        dsdv_t = N*k/V - dTdV_r
+        dpdt_v = N*k/V - dTdV_r
+        dpdv_t = -N*k*T/V**2 - dV2_r
+        
+        mass = 0.
+
+        for c in self.moles:
+            mass += c.mw * self.moles[c] / self.n_molecules
+        mass = mass * 1e-3
+
+        dpdv_s = dpdv_t - dpdt_v * dsdv_t / dsdt_v
+        dpdv_s = dpdv_s * N / cst.Na # Pa/(m3/mol)
+        vm = V * cst.Na / N
+        w = -vm**2 * dpdv_s  # dp/d(rho) J / mol
+        w = w / mass # J/kg = m2/s2
+        w = sqrt(w)
+        return w
+
+    def get_jt(self, temperature=None, volume=None, molar_volume=None):
+        '''
+        Calculates Joule-Thomson coefficient in units K m3 / J
+        where u_JT = (dT/dP)_h
+        '''
+        if temperature == None or (not isinstance(temperature, (int, float))):
+            temperature = self.temperature
+        if molar_volume != None and isinstance(molar_volume, (int, float)):
+            volume = self.set_molar_volume(molar_volume)
+        elif volume == None or (not isinstance(volume, (int, float))):
+            volume = self.volume
+
+        self.temperature = temperature
+        self.volume = volume
+
+        d2r = self.dTdV(a='res')
+        dt2_id = self.dT2(a='id')
+        dTdV_r = d2r[1]
+        dV2_r = d2r[2]
+        dT2 = dt2_id + d2r[0]
+
+        T = temperature
+        V = volume * cst.nmtom**3
+        N = self.n_molecules
+        k = cst.k
+
+        dhdt_v = -T * dT2 + N*k - V * dTdV_r
+        dhdv_t = -T * dTdV_r - V * dV2_r
+        dpdt_v = N*k/V - dTdV_r
+        dpdv_t = -N*k*T/V**2 - dV2_r
+
+        dtdp_h = (dpdt_v - dpdv_t * dhdt_v / dhdv_t) ** -1
+        ujt = dtdp_h
+        return ujt
     # End direct properties ###########
 
     # Calculate critical point ########
@@ -363,7 +542,7 @@ class System(object):
         v_ = [x[0]*scaler[0], x[1]*scaler[1]]
         for i in v_:
             self.volume = Var(mt.m3mol_to_nm(i, molecules=self.n_molecules))
-            Pi = -self.dV() / pow(cst.nmtom,3)
+            Pi = -self.dV()
             P.append(Pi)
             G.append((A.value + Pi * self.volume.value*pow(cst.nmtom,3))*cst.Na)
 
@@ -403,18 +582,18 @@ class System(object):
         x = x[0]
         v = mt.m3mol_to_nm(x, molecules=self.n_molecules)
         self.volume = v
-        P = -self.dV() / pow(cst.nmtom,3)
+        P = -self.dV()
 
         return P - targetP
 
-    def single_phase_v(self, P, T=None, print_results=True, get_density=False, use_jac=False, vle_ig=(1e-4, 1e-2), v_crit=None, supercritical=False, solver_kwargs={'bounds': (1e-4,1e-1)}):
-        if isinstance(T, float):
+    def single_phase_v(self, P, T=None, print_results=True, get_density=False, use_jac=False, vle_ig=(1e-4, 1e-2), v_crit=None, v_init=None, supercritical=False, solver_kwargs={'bounds': (1e-4,1e-1)}):
+        if isinstance(T, (int,float)):
             self.temperature = T
 
-        if isinstance(P, float) or isinstance(P, int):
+        if isinstance(P, (int,float)):
             if supercritical:
                 mt.checkerr(v_crit is not None, "For supercritical, please provide v_crit")
-                v_init = v_crit
+                v_init = v_crit if v_init is None else v_init
                 solver_kwargs['bounds'] = (0.2 * v_crit, 1000*v_crit)
             else:
                 if v_crit is not None:
@@ -2414,19 +2593,89 @@ def main():
     (pc, tc, rhoc) = s.critical_point(initial_t=300., v_nd=np.logspace(-4,-1,70), get_volume=False, get_density=True, print_results=False, print_progress=True)
     print('{:25s}{:8.3f}'.format('critical P (bar)', pc*cst.patobar))
     print('{:25s}{:8.3f}'.format('critical T (K)', tc))
-    print('{:25s}{:8.3f}'.format('critical rho (mol/m3)', rhoc*1e-3*vrc['HFO-1234yf'].mw))
-    vget = s.single_phase_v(15e6, 400, print_results=False, v_crit=1/rhoc, supercritical=True)
+    print('{:25s}{:8.3f}'.format('critical rho (mol/m3)', rhoc*1e-3*vrc['SF6'].mw))
+    vget = s.single_phase_v(15e6, 550, print_results=False, v_crit=1/rhoc, supercritical=True)
     print('{:25s}{:8.3f}'.format('sp_v (1e-3 m3/mol)', vget * 1e3))
-    print('{:25s}{:8.3f}'.format('rho (kg/m3)',1/vget*1e-3*vrc['HFO-1234yf'].mw))
+    print('{:25s}{:8.3f}'.format('rho (kg/m3)',1/vget*1e-3*vrc['SF6'].mw))
     s.set_molar_volume(vget)
+    s.temperature = 550
     print('{:25s}{:8.3f}'.format('get_pressure (MPa)',s.get_pressure()*1e-6))
+    print('{:25s}{:8.3f}'.format('get_entropy (J/mol K)',s.get_entropy()))
+    print('{:25s}{:8.3f}'.format('get_u (J/mol)',s.get_u()))
+    print('{:25s}{:8.3f}'.format('get_enthalpy (J/mol)',s.get_enthalpy()))
+    print('{:25s}{:8.3f}'.format('get_gibbs (J/mol)',s.get_gibbs()))
     print('{:25s}{:8.3f}'.format('get_cv (J/mol K)',s.get_cv()))
     print('{:25s}{:8.3f}'.format('get_kappa (1/MPa)',s.get_kappa() * 1e6))
+    print('{:25s}{:8.3f}'.format('get_cp (J/mol K)',s.get_cp()))
+    print('{:25s}{:8.3f}'.format('get_cp (kJ/kg K)',s.get_cp()/vrc['SF6'].mw))
+    print('{:25s}{:8.3f}'.format('get_w (m/s)',s.get_w()))
+    print('{:25s}{:8.3f}'.format('get_jt (K/MPa)',s.get_jt() *1e6))
     print('{:25s}'.format('dv2'),s.dV2(), s.n_molecules * cst.k * s.temperature / s.volume**2 + s.dV2(a='res'))
     print('{:25s}'.format('dt2'),s.dT2())
     print('{:25s}'.format('dtdv'),s.dTdV())
     xa = s.dTdV(a='res')
     print('{:25s}'.format('dtdv'), -s.n_molecules * cst.k / s.volume + xa[1])
+
+    print('='*20)
+    print('Testing get properties with SAFTgMie')
+    print('='*20)
+
+    nbutane = GMieComponent().quick_set((CH3,2), (CH2,1))
+    npentane = GMieComponent().quick_set((CH3,2), (CH2,3))
+    noctane = GMieComponent().quick_set((CH3,2), (CH2,6))
+    ndecane = GMieComponent().quick_set((CH3,2), (CH2,8))
+
+    C4s = SAFTgMieSystem().quick_set((nbutane, 100))
+    C5s = SAFTgMieSystem().quick_set((npentane, 100))
+    C8s = SAFTgMieSystem().quick_set((noctane, 100))
+    C10s = SAFTgMieSystem().quick_set((ndecane, 100))
+
+    # C5 speed of sound
+    # (pc, tc, rhoc) = C5s.critical_point(initial_t=480., v_nd=np.logspace(-4,-1,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
+    # print(pc, tc, 1/rhoc)
+    # trange = np.linspace(300,700,10)
+    # vget = np.zeros(10)
+    # w = np.zeros(10)
+    # for i in range(len(trange)):
+    #     t = trange[i]
+    #     vget[i] = C5s.single_phase_v(5e6, t, print_results=False, v_crit=1/rhoc, supercritical=True)
+    #     w[i] = C5s.get_w(temperature=t, molar_volume=vget[i])
+
+    # fig, ax = plt.subplots()
+    # ax.plot(trange, w, 'bo')
+    # plt.show()
+
+    # C4 isothermal compressibility
+    # (pc, tc, rhoc) = C4s.critical_point(initial_t=380., v_nd=np.logspace(-4,-1,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
+    # print(pc, tc, 1/rhoc)
+    # trange = np.linspace(300,700,15)
+    # vget = np.zeros(15)
+    # k = np.zeros(15)
+    # for i in range(len(trange)):
+    #     t = trange[i]
+    #     vget[i] = C4s.single_phase_v(10e6, t, print_results=False, v_crit=1/rhoc, v_init=0.3/rhoc, supercritical=True)
+    #     print(vget[i])
+    #     k[i] = C4s.get_kappa(temperature=t, molar_volume=vget[i])
+    # fig, ax = plt.subplots()
+    # ax.plot(trange, k*1e9, 'bo')
+    # print(k * 1e9)
+    # plt.show()
+
+    # C10 Cp
+    # (pc, tc, rhoc) = C10s.critical_point(initial_t=380., v_nd=np.logspace(-3.5,-0.5,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
+    # print(pc, tc, 1/rhoc)
+    # trange = np.linspace(500,700,15)
+    # vget = np.zeros(15)
+    # cp = np.zeros(15)
+    # for i in range(len(trange)):
+    #     t = trange[i]
+    #     vget[i] = C10s.single_phase_v(3e6, t, print_results=False, v_crit=1/rhoc, v_init=0.3/rhoc, supercritical=True)
+    #     cp[i] = C10s.get_cp(temperature=t, molar_volume=vget[i])
+    # fig, ax = plt.subplots()
+    # ax.plot(trange, cp, 'bo')
+    # print(cp)
+    # plt.show()
+
     '''
     comps = {}
     puresys = {}
