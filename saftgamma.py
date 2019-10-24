@@ -679,8 +679,7 @@ class SAFTVRSystem(System):
         self.segden = segratio * self.n_den()
 
         # calculate helmholtz through indiv contributions
-        a = self.a_ideal() + self.a_mono() + self.a_chain() + self.a_assoc()
-        A = a * self.n_molecules * cst.k * self.temperature
+        A = self.a_ideal() + self.a_res() * self.n_molecules * cst.k * self.temperature
 
         return A
 
@@ -709,49 +708,60 @@ class SAFTVRSystem(System):
         self.segden = segratio * self.n_den()
 
         # calculate helmholtz through indiv contributions
-        a = self.a_mono() + self.a_chain() + self.a_assoc()
+        a = self.a_res()
         A = a * self.n_molecules * cst.k * self.temperature
         return A
 
     def helmholtz_ideal(self):
-        # CHECK if we need all these for ideal term. Unlikely need any except maybe segden / segratio
         # calculate stored values
-        nvr = VRMieComponent.n_total()
-        self.hsd = np.zeros((nvr, nvr), dtype=object)
-        self.gcomb = np.zeros((nvr, nvr), dtype=object)
-        segratio = 0.
         for comp in self.moles:
             # molfrac
             self.molfrac[comp] = self.moles[comp] / self.n_molecules
-            # hard-sphere diam
-            ci = comp.index
-            self.hsd[ci, ci] = comp.hsd(self.temperature) * 1e-10
-            for comp2 in self.moles:
-                ci2 = comp2.index
-                if self.hsd[ci, ci2] == 0. and self.hsd[ci2, ci2] != 0.:
-                    self.hsd[ci, ci2] = (self.hsd[ci,ci] + self.hsd[ci2, ci2]) / 2
-                    self.hsd[ci2, ci] = (self.hsd[ci,ci] + self.hsd[ci2, ci2]) / 2
-                #gcomb
-                self.gcomb[ci, ci2] = comp + comp2
-            # segden
-            segratio += self.molfrac[comp] * comp.ms
-        self.segratio = segratio
-        self.segden = segratio * self.n_den()
 
         # calculate helmholtz through indiv contributions
-        a = self.a_ideal()
-        A = a * self.n_molecules * cst.k * self.temperature
+        A = self.a_ideal()
         return A
 
     def a_ideal(self):
         result = 0.
         mole_tol = self.n_molecules
+        cpideal = True
         for comp in self.moles:
-            debrogv = pow(comp.thdebroglie(self.temperature),3)
-            molfrac = self.molfrac[comp]
-            nden = molfrac * self.n_den()
-            result = result + molfrac * log(nden * debrogv)
-        return result - 1
+            cpint = comp.cp_int(self.temperature)
+            if cpint is None:
+                cpideal = False
+
+        if cpideal == False:
+            for comp in self.moles:
+                debrogv = pow(comp.thdebroglie(self.temperature),3)
+                molfrac = self.molfrac[comp]
+                nden = molfrac * self.n_den()
+                result = result + molfrac * log(nden * debrogv) 
+            result = result - 1
+            return result * self.n_molecules * cst.k * self.temperature
+        
+        for comp in self.moles:
+            h0 = comp.ref[0]
+            s0 = comp.ref[1]
+            tref = comp.ref[2]
+            pref = comp.ref[3]
+            vref = cst.Na * cst.k * tref / pref
+            t = self.temperature
+            xi = self.molfrac[comp]
+            n_mol = self.n_molecules / cst.Na
+            V = self.volume * cst.nmtom**3
+            cpint = comp.cp_int(t)
+            cptint = comp.cp_t_int(t)
+            
+            si = cptint - cst.Na * cst.k * log(xi * t * vref * n_mol / (tref*V)) + s0
+
+            ai_mol = cpint - t * si - cst.Na * cst.k * t + h0 # per mol
+            result = result + xi * n_mol * ai_mol
+
+        return result
+
+    def a_res(self):
+        return self.a_mono() + self.a_chain() + self.a_assoc()
 
     def a_mono(self):
         a_m = self.a_hs() + self.a_1() + self.a_2() + self.a_3()
