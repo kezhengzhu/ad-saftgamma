@@ -1280,8 +1280,7 @@ class SAFTgMieSystem(System):
             self.chsd[ci] = hsdii
 
         # calculate helmholtz through indiv contributions
-        a = self.a_ideal() + self.a_res()
-        A = a * self.n_molecules * cst.k * self.temperature
+        A = self.a_ideal() + self.a_res() * self.n_molecules * cst.k * self.temperature
 
         return A
 
@@ -1332,61 +1331,55 @@ class SAFTgMieSystem(System):
         return A
 
     def helmholtz_ideal(self):
-        # CHECK if we need all these for ideal term. Unlikely need any except maybe segden / segratio
         # calculate stored values
-        nmg = GMieGroup.n_total()
-        self.ghsd = np.zeros((nmg, nmg), dtype=object)
-        self.gcomb = np.zeros((nmg, nmg), dtype=object)
-        segratio = 0.
-
         for comp in self.moles:
             # molfrac
             self.molfrac[comp] = self.moles[comp] / self.n_molecules
 
         self.get_groups() # in case molfrac is Var
-
-        for g in self.groups:
-            # hard-sphere diam
-            gi = g.index
-            self.ghsd[gi, gi] = g.hsd(self.temperature) * 1e-10
-            for g2 in self.groups:
-                gi2 = g2.index
-                if self.ghsd[gi, gi2] == 0. and self.ghsd[gi2, gi2] != 0.:
-                    self.ghsd[gi, gi2] = (self.ghsd[gi,gi] + self.ghsd[gi2, gi2]) / 2
-                    self.ghsd[gi2, gi] = (self.ghsd[gi,gi] + self.ghsd[gi2, gi2]) / 2
-                #gcomb
-                self.gcomb[gi, gi2] = g + g2
-            # segden
-            segratio += self.groups[g] * g.vk * g.sf
-
-        self.segratio = segratio
-        self.segden = segratio * self.n_den()
-
-        # chain comb
-        nc = GMieComponent.n_total()
-        self.chsd = np.zeros((nc,), dtype=object)
-        self.ccomb = np.zeros((nc,), dtype=object)
-        for c in self.moles:
-            ci = c.index
-            gc, hsdii = c.get_gtypeii(hsd=self.ghsd)
-            self.ccomb[ci] = gc
-            self.chsd[ci] = hsdii
             
         # calculate helmholtz through indiv contributions
-        a = self.a_ideal()
-        A = a * self.n_molecules * cst.k * self.temperature
+        A = self.a_ideal()
 
         return A
 
     def a_ideal(self):
         result = 0.
         mole_tol = self.n_molecules
+        cpideal = True
         for comp in self.moles:
-            debrogv = pow(comp.thdebroglie(self.temperature),3)
-            molfrac = self.molfrac[comp]
-            nden = molfrac * self.n_den()
-            result = result + molfrac * log(nden * debrogv)
-        return result - 1
+            cpint = comp.cp_int(self.temperature)
+            if cpint is None:
+                cpideal = False
+
+        if cpideal == False:
+            for comp in self.moles:
+                debrogv = pow(comp.thdebroglie(self.temperature),3)
+                molfrac = self.molfrac[comp]
+                nden = molfrac * self.n_den()
+                result = result + molfrac * log(nden * debrogv) 
+            result = result - 1
+            return result * self.n_molecules * cst.k * self.temperature
+        
+        for comp in self.moles:
+            h0 = comp.ref[0]
+            s0 = comp.ref[1]
+            tref = comp.ref[2]
+            pref = comp.ref[3]
+            vref = cst.Na * cst.k * tref / pref
+            t = self.temperature
+            xi = self.molfrac[comp]
+            n_mol = self.n_molecules / cst.Na
+            V = self.volume * cst.nmtom**3
+            cpint = comp.cp_int(t)
+            cptint = comp.cp_t_int(t)
+            
+            si = cptint - cst.Na * cst.k * log(xi * t * vref * n_mol / (tref*V)) + s0
+
+            ai_mol = cpint - t * si - cst.Na * cst.k * t + h0 # per mol
+            result = result + xi * n_mol * ai_mol
+
+        return result
 
     def a_res(self):
         a_r = self.a_mono() + self.a_chain() + self.a_assoc()
@@ -1880,6 +1873,8 @@ class MieGroup(object):
 class Component(object):
     def __init__(self, molar_weight):
         self.mw = molar_weight
+        self.cp = None
+        self.ref = None
 
     def thdebroglie(self, temp):
         '''
@@ -1887,6 +1882,41 @@ class Component(object):
         '''
         Lambda_sq = pow(cst.h,2) * 1e3 * cst.Na / (2 * pi * self.mw * cst.k * temp)
         return sqrt(Lambda_sq)
+
+    def set_cp_ideal(self, cpparam, ref=(0.,0.,273.15,101325)):
+        mt.checkerr(isinstance(cpparam, (np.ndarray, list, tuple)) and len(cpparam)==4,
+            "Cp parameters must be iterable with length of 4")
+        # Cp parameters in form [A, B, C, D]
+        self.cp = cpparam
+        self.ref = ref # ref: h0, s0, T0, P0
+
+    def cp_int(self, T):
+        # cp integral evaluated at T
+        # A(T-Tref) + B/2(T^2-Tref^2) + C/3(T^3-Tref^3) + D/4(T^4-Tref^4)
+        if self.cp is None: return None
+
+        A = self.cp[0]
+        B = self.cp[1]
+        C = self.cp[2]
+        D = self.cp[3]
+        tref = self.ref[2]
+
+        cpint = A*T + (B/2)*T**2 + (C/3)*T**3 + (D/4)*T**4 - (A*tref + (B/2)*tref**2 + (C/3)*tref**3 + (D/4)*tref**4)
+        return cpint
+
+    def cp_t_int(self, T):
+        # cp/T integral evaluated at T
+        # A (ln(T)-ln(Tref)) + B(T-Tref) + C/2(T^2-Tref^2) + D/3(T^3-Tref^3)
+        if self.cp is None: return None
+
+        A = self.cp[0]
+        B = self.cp[1]
+        C = self.cp[2]
+        D = self.cp[3]
+        tref = self.ref[2]
+
+        cptint = A*log(T) + B*T + (C/2)*T**2 + (D/3)*T**3 - (A*log(tref) + B*tref + (C/2)*tref**2 + (D/3)*tref**3)
+        return cptint
 
 class VRMieComponent(MieGroup, Component):
     '''
@@ -2058,10 +2088,20 @@ class GMieGroup(MieGroup):
         GMieGroup._total += 1
         GMieGroup.add_elem()
 
+        self.cp = None
+        self.ref = None
+
     def __repr__(self):
         if isinstance(self.name, str):
             return "G-Mie {:s} group".format(self.name)
         return "G-Mie: sf={:4.3f}, id_seg={:4.3f} ".format(self.sf, self.vk) + super().__repr__()
+
+    def set_cp_ideal(self, cpparam, ref=(0.,0.,273.15,101325)):
+        mt.checkerr(isinstance(cpparam, (np.ndarray, list, tuple)) and len(cpparam)==4,
+            "Cp parameters must be iterable with length of 4")
+        # Cp parameters in form [A, B, C, D]
+        self.cp = cpparam
+        self.ref = ref # ref: h0, s0, T0, P0
 
     # Combining rules with exceptions build-in
     _ktable = np.array([[0.]])
@@ -2293,146 +2333,31 @@ class GMieComponent(Component):
             return mg
         return (mg, hsdii)
 
-class GroupType(object):
-    _etable = np.array([[0.]])
-    _lrtable = np.array([[0.]])
-    _total = 0
-    def __init__(self, lambda_r, lambda_a, sigma, epsilon, shape_factor=1, id_seg=1, comb=False, cp_param=None, h0=None, s0=None):
-        self.rep = lambda_r
-        self.att = lambda_a
-        self.sigma = sigma # units AU?
-        self.epsilon = epsilon # units K input, divided by cst.k (epsi / k), so multiply k here
-        self.sk = shape_factor # dimensionless segments
-        self.vk = id_seg # identical segments in a group
-        if cp_param == None:
-            self.cpparam = None
-            self.h0 = None
-            self.s0 = None
-        else:
-            self.cpparam = cp_param #
-            self.h0 = h0
-            self.s0 = s0
-        self.children = []
-        self.comb = comb
-        if comb == False:
-            self.index = GroupType._total
-            GroupType._total += 1
-            GroupType.add_elem()
-        self.hsd = None
+    def cp_int(self, T):
+        if self.cp is None:
+            self.cp = [0] * 4
+            for g in self.groups:
+                if g.cp is None:
+                    self.cp = None
+                    return None
+                for i in range(4):
+                    self.cp[i] += self.groups[g] * g.cp[i]
+            self.ref = (0.,0.,273.15,101325) # default reference state
 
-    @classmethod
-    def add_elem(cls):
-        t1 = cls._etable
-        t2 = cls._lrtable
-        if cls._total > 1:
-            t12 = np.append(t1, np.zeros((1, t1.shape[1])), axis=0)
-            cls._etable = np.append(t12, np.zeros((t12.shape[0], 1)), axis=1)
-            t22 = np.append(t2, np.zeros((1, t2.shape[1])), axis=0)
-            cls._lrtable = np.append(t22, np.zeros((t22.shape[0], 1)), axis=1)
+        return super().cp_int(T)
 
-    @classmethod
-    def print_table(cls):
-        print("{:40s}".format("Total defined group types: "), cls._total)
-        print("{:40s}".format("Combination k values for Epsilon: "), cls._etable)
-        print("{:40s}".format("Combination k values for Lambda_r: "), cls._lrtable)
+    def cp_t_int(self, T):
+        if self.cp is None:
+            self.cp = [0] * 4
+            for g in self.groups:
+                if g.cp is None:
+                    self.cp = None
+                    return None
+                for i in range(4):
+                    self.cp[i] += self.groups[g] * g.cp[i]
+            self.ref = (0.,0.,273.15,101325) # default reference state
 
-    @classmethod
-    def combining_e_kij(cls, g1, g2, val):
-        try:
-            i1 = g1.index
-            i2 = g2.index
-        except:
-            raise Exception("Index not available. Do not set combination rules for group combinations")
-        cls._etable[i1,i2] = val
-        cls._etable[i2,i1] = val
-
-    @classmethod
-    def combining_e_val(cls, g1, g2, val):
-        try:
-            i1 = g1.index
-            i2 = g2.index
-        except:
-            raise Exception("Index not available. Do not set combination rules for group combinations")
-        s1 = g1.sigma
-        s2 = g2.sigma
-        e1 = g1.epsilon
-        e2 = g2.epsilon
-
-        actl = sqrt(pow(s1,3) * pow(s2,3)) / pow((s1+s2)/2, 3) * sqrt(e1 * e2)
-        ratio = val / actl
-        kij = 1 - ratio
-        cls._etable[i1,i2] = kij
-        cls._etable[i2,i1] = kij
-
-    @classmethod
-    def combining_lr_gij(cls, g1, g2, val):
-        try:
-            i1 = g1.index
-            i2 = g2.index
-        except:
-            raise Exception("Index not available. Do not set combination rules for group combinations")
-        cls._lrtable[i1,i2] = val
-        cls._lrtable[i2,i1] = val
-
-    @classmethod
-    def combining_lr_val(cls, g1, g2, val):
-        try:
-            i1 = g1.index
-            i2 = g2.index
-        except:
-            raise Exception("Index not available. Do not set combination rules for group combinations")
-        lr1 = g1.rep
-        lr2 = g2.rep
-
-        intm = val - 3
-        ratio = intm / sqrt((lr1 - 3) * (lr2 - 3))
-        gij = 1 - ratio
-        cls._lrtable[i1,i2] = gij
-        cls._lrtable[i2,i1] = gij
-    
-    def __repr__(self):
-        return '<GroupType({:4.3f} nm, {:4.3f} K, rep={:5.3f}, att={:5.3f})>'.format(self.sigma, self.epsilon, self.rep, self.att)
-
-    def hsdiam(self, si_temp, x_inf=0): # returns in nm
-        if len(self.children) >= 2:
-            hsd = 0.
-            for g in self.children:
-                coeff = g[0]
-                gc = g[1]
-                expo = g[2]
-                hsd += coeff * pow(gc.hsdiam(si_temp),expo)
-            self.hsd = pow(hsd, 1/expo)
-            return hsd
-        self.hsd = mt.hsdiam(si_temp / self.epsilon, self.rep, self.att, x_inf) * self.sigma
-        return self.hsd
-
-    def __add__(self, other):
-        sig = (self.sigma + other.sigma) / 2
-        epsi = sqrt(pow(self.sigma, 3) * pow(other.sigma, 3)) / pow(sig,3) * sqrt(self.epsilon * other.epsilon)
-        if not (self.comb and other.comb):
-            ratio = 1 - GroupType._etable[self.index, other.index]
-            epsi = ratio*epsi
-        repratio = sqrt( (self.rep - 3) * (other.rep - 3) )
-        if not (self.comb and other.comb):
-            ratio = 1 - GroupType._lrtable[self.index, other.index]
-            repratio = ratio * repratio
-        rep = 3 + repratio
-        att = 3 + sqrt( (self.att - 3) * (other.att - 3) )
-
-        z = GroupType(rep, att, sig, epsi, shape_factor=None, id_seg=None, comb=True)
-        z.children.append((0.5,self,1))
-        z.children.append((0.5,other,1))
-        return z
-
-    def premie(self):
-        return self.rep/(self.rep-self.att) * pow(self.rep/self.att, self.att/(self.rep-self.att))
-
-    def x0kl(self, si_temp):
-        x = self.sigma / self.hsdiam(si_temp)
-        mt.checkwarn(x >= 1, "x0kl/x0ii below 1, could result in inaccurate representation of values")
-        mt.checkwarn(x <= sqrt(2), "x0kl/x0ii above sqrt 2, could result in inaccurate representation of values")
-        return x
-
+        return super().cp_t_int(T)
 
 def main():
     CH4 = MieGroup(12.504, 6., 3.737, 152.575)
@@ -2524,6 +2449,10 @@ def main():
     C2H6 = GMieGroup(   10.16,    6.,    3.488,  165.513, molar_weight=30.07004, shape_factor=0.855,     id_seg=2, name="C2H6")
     CH4 =  GMieGroup(  12.504,    6.,    3.737,  152.575, molar_weight=16.04296, shape_factor=1,         id_seg=1, name="CH4")
 
+    CH3.set_cp_ideal((19.5,-8.08e-3,1.53e-4,-9.67e-8))
+    CH2.set_cp_ideal((-0.909,0.095,-5.44e-5,1.19e-8))
+    C2H6.set_cp_ideal((12.4755767,1.44286617e-1,-2.3523953e-5,-8.99334179e-9))
+
     GMieGroup.combining_e_val(CH3, CH2, 350.77)
     GMieGroup.combining_e_val(CH3, COO, 402.75)
     GMieGroup.combining_e_val(COO, CH2, 498.86)
@@ -2590,7 +2519,7 @@ def main():
     s = SAFTVRSystem().quick_set((vrc['SF6'], 1000))
     # co2 = GMieComponent().quick_set((CO2, 1))
     # s = SAFTgMieSystem().quick_set((co2, 1000))
-    (pc, tc, rhoc) = s.critical_point(initial_t=300., v_nd=np.logspace(-4,-1,70), get_volume=False, get_density=True, print_results=False, print_progress=True)
+    (pc, tc, rhoc) = s.critical_point(initial_t=325.9, v_nd=np.logspace(-4,-1,70), get_volume=False, get_density=True, print_results=False, print_progress=True)
     print('{:25s}{:8.3f}'.format('critical P (bar)', pc*cst.patobar))
     print('{:25s}{:8.3f}'.format('critical T (K)', tc))
     print('{:25s}{:8.3f}'.format('critical rho (mol/m3)', rhoc*1e-3*vrc['SF6'].mw))
@@ -2608,7 +2537,7 @@ def main():
     print('{:25s}{:8.3f}'.format('get_kappa (1/MPa)',s.get_kappa() * 1e6))
     print('{:25s}{:8.3f}'.format('get_cp (J/mol K)',s.get_cp()))
     print('{:25s}{:8.3f}'.format('get_cp (kJ/kg K)',s.get_cp()/vrc['SF6'].mw))
-    print('{:25s}{:8.3f}'.format('get_w (m/s)',s.get_w()))
+    print('{:25s}{:8.3f}'.format('get_w (m/s)',s.get_w()))  
     print('{:25s}{:8.3f}'.format('get_jt (K/MPa)',s.get_jt() *1e6))
     print('{:25s}'.format('dv2'),s.dV2(), s.n_molecules * cst.k * s.temperature / s.volume**2 + s.dV2(a='res'))
     print('{:25s}'.format('dt2'),s.dT2())
@@ -2629,6 +2558,9 @@ def main():
     C5s = SAFTgMieSystem().quick_set((npentane, 100))
     C8s = SAFTgMieSystem().quick_set((noctane, 100))
     C10s = SAFTgMieSystem().quick_set((ndecane, 100))
+
+    print(nbutane.cp_int(300), nbutane.cp_t_int(300))
+    print(npentane.cp_int(300), npentane.cp_t_int(300))
 
     # C5 speed of sound
     # (pc, tc, rhoc) = C5s.critical_point(initial_t=480., v_nd=np.logspace(-4,-1,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
@@ -2662,19 +2594,19 @@ def main():
     # plt.show()
 
     # C10 Cp
-    # (pc, tc, rhoc) = C10s.critical_point(initial_t=380., v_nd=np.logspace(-3.5,-0.5,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
-    # print(pc, tc, 1/rhoc)
-    # trange = np.linspace(500,700,15)
-    # vget = np.zeros(15)
-    # cp = np.zeros(15)
-    # for i in range(len(trange)):
-    #     t = trange[i]
-    #     vget[i] = C10s.single_phase_v(3e6, t, print_results=False, v_crit=1/rhoc, v_init=0.3/rhoc, supercritical=True)
-    #     cp[i] = C10s.get_cp(temperature=t, molar_volume=vget[i])
-    # fig, ax = plt.subplots()
-    # ax.plot(trange, cp, 'bo')
-    # print(cp)
-    # plt.show()
+    (pc, tc, rhoc) = C10s.critical_point(initial_t=380., v_nd=np.logspace(-3.5,-0.5,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
+    print(pc, tc, 1/rhoc)
+    trange = np.linspace(500,700,15)
+    vget = np.zeros(15)
+    cp = np.zeros(15)
+    for i in range(len(trange)):
+        t = trange[i]
+        vget[i] = C10s.single_phase_v(3e6, t, print_results=False, v_crit=1/rhoc, v_init=0.3/rhoc, supercritical=True)
+        cp[i] = C10s.get_cp(temperature=t, molar_volume=vget[i])
+    fig, ax = plt.subplots()
+    ax.plot(trange, cp, 'bo')
+    print(cp)
+    plt.show()
 
     '''
     comps = {}
