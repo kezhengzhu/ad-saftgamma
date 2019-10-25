@@ -541,10 +541,11 @@ class System(object):
         G = []
         v_ = [x[0]*scaler[0], x[1]*scaler[1]]
         for i in v_:
-            self.volume = Var(mt.m3mol_to_nm(i, molecules=self.n_molecules))
+            self.volume = mt.m3mol_to_nm(i, molecules=self.n_molecules)
+            A = self.helmholtz()
             Pi = -self.dV()
             P.append(Pi)
-            G.append((A.value + Pi * self.volume.value*pow(cst.nmtom,3))*cst.Na)
+            G.append((A + Pi * self.volume*pow(cst.nmtom,3))*cst.Na)
 
         if print_: print(f'Current: v\'s = {v_[0]:7.3e}, {v_[1]:7.3e}; dP = {(P[0]-P[1]):7.3e}, dG = {(G[0]-G[1]):7.3e}')
         return np.array([(P[0]-P[1]), (G[0]-G[1])])
