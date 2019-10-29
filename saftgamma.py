@@ -85,7 +85,6 @@ class System(object):
         
         return da
 
-
     def dV(self, a='both'):
         Var.set_order(1)
         V = self.volume
@@ -184,25 +183,25 @@ class System(object):
         Var.set_order(1)
         # Case single volume value
         if isinstance(volume, float):
-            self.volume = Var(volume)
-            A = self.helmholtz()
-            result = -derivative(A,self.volume,order=1) / pow(cst.nmtom,3)
-
-            # Reset system back to float
             self.volume = volume
-            return result
+
+            dArdV = self.dV(a='res')
+            P = (self.n_molecules / (volume * cst.nmtom**3) * cst.k * temperature - dArdV)
+
+            return P
 
         # Case numpy array
         old_v = self.volume
         vlen = np.size(volume)
         P = np.zeros(vlen)
         if gibbs: G = np.zeros(vlen)
-
         self.volume = Var(volume)
-        A = self.helmholtz()
-        P = -derivative(A,self.volume) / pow(cst.nmtom,3)
+        A = self.helmholtz().value
+        self.volume = volume
+        dArdV = self.dV(a='res')
+        P = (self.n_molecules / (volume * cst.nmtom**3) * cst.k * temperature - dArdV)
 
-        if gibbs: G = (A.value + P * self.volume.value*pow(cst.nmtom,3))/self.n_molecules
+        if gibbs: G = (A + P * self.volume*pow(cst.nmtom,3))/self.n_molecules
 
         # Reset system back to float
         self.volume = old_v
@@ -482,7 +481,6 @@ class System(object):
         x0 = np.array([1.])
         if not isinstance(solver_kwargs, dict): solver_kwargs = {}
         if not isinstance(v_nd, np.ndarray): v_nd = np.logspace(-4,-2, 50)
-        Var.set_order(2)
         crit_pt = solver(self.__crit_t, x0, xtol=xtol, args=(v_nd, tscale, print_progress),**solver_kwargs)
 
         if print_progress: print()
@@ -491,17 +489,17 @@ class System(object):
 
         parr = self.__crit_t(np.array([T]), v_nd, 1, False, True)
         v_guess = v_nd[parr==max(parr)]
+
         crit_v = solver(self.__crit_v, v_guess, xtol=xtol, args=(T,), bounds=(min(v_nd), max(v_nd)))
         v = crit_v.x[0]
+        V = mt.m3mol_to_nm(v, molecules=self.n_molecules)
         
-        Var.set_order(1)
-        self.volume = Var(mt.m3mol_to_nm(v, molecules=self.n_molecules))
+        self.volume = V
         self.temperature = T
 
-        A = self.helmholtz()
-        P = -derivative(A, self.volume, order=1) / pow(cst.nmtom,3)
+        dArdV = self.dV(a='res')
+        P = (self.n_molecules / (V * cst.nmtom**3) * cst.k * T - dArdV)
 
-        self.volume = mt.m3mol_to_nm(v, molecules=self.n_molecules)
         results = (P, T)
         if get_volume: results += (v,)
         if get_density: results += (1/v,)
@@ -511,22 +509,46 @@ class System(object):
     def __crit_v(self, v, T):
         self.temperature = T
         v = v[0]
-        self.volume = Var(mt.m3mol_to_nm(v, molecules=self.n_molecules))
-        A = self.helmholtz()
-        _, dpdv = derivative(A, self.volume, order=2)
-        dpdv = -dpdv / (pow(cst.nmtom,6) * cst.Na) / (cst.R * T)
+        V = mt.m3mol_to_nm(v, molecules=self.n_molecules)
+        self.volume = V
+        N = self.n_molecules
+        k = cst.k
+        dpdv = -N*k*T/V**2/cst.nmtom**6 - self.dV2(a='res')
 
-        return dpdv
+        dp = dpdv * self.n_molecules / cst.Na 
+
+        return dp
 
     def __crit_t(self, x, v_nd, scale, print_, getarr=False):
         T = x[0] * scale
 
         # numpy version
-        self.volume = Var(mt.m3mol_to_nm(v_nd, molecules=self.n_molecules))
+        v = mt.m3mol_to_nm(v_nd, molecules=self.n_molecules)
+        self.volume = v
         self.temperature = T
-        A = self.helmholtz()
-        _,dpdv = derivative(A, self.volume, order=2)
-        dp = -dpdv / (pow(cst.nmtom,6) * cst.Na) / (cst.R * T)
+        N = self.n_molecules
+        k = cst.k
+        dpdv = -N*k*T/v**2/cst.nmtom**6 - self.dV2(a='res')
+
+        dp = dpdv * cst.nmtom**3
+
+        if print_: 
+            print(f'Current: T = {T:7.3f}: max dP/dV = {max(dp):7.3e}', end='\r')
+        return max(dp) if getarr == False else dp
+
+    def crit_t(self, x, v_nd, scale, print_, getarr=False):
+        T = x[0] * scale
+
+        # numpy version
+        v = mt.m3mol_to_nm(v_nd, molecules=self.n_molecules)
+        self.volume = v
+        self.temperature = T
+        N = self.n_molecules
+        k = cst.k
+        dpdv = -N*k*T/v**2/cst.nmtom**6 - self.dV2(a='res')
+        # A = self.helmholtz()
+        # _,dpdv = derivative(A, self.volume, order=2)
+        dp = dpdv *cst.nmtom**3 #* self.n_molecules / cst.Na 
         if print_: 
             print(f'Current: T = {T:7.3f}: max dP/dV = {max(dp):7.3e}', end='\r')
         return max(dp) if getarr == False else dp
