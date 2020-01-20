@@ -11,6 +11,7 @@ from dervarnp import *
 
 import defconst as cst
 import methods as mt 
+import assoccorr as acor
 
 class System(object):
     def __init__(self, temperature=293, pressure=101325, volume=1000, *args):
@@ -34,6 +35,8 @@ class System(object):
         return self.volume
 
     def quick_set(self, *args):
+        self.moles = {}
+        self.molfrac = {}
         for arg in args:
             mt.checkerr(isinstance(arg, tuple) or isinstance(arg, list), "Use iterable tuple or list for quick_set")
             mt.checkerr(isinstance(arg[0], Component), "First element of iterable must be an instance of Component class")
@@ -45,7 +48,6 @@ class System(object):
         nmoles = self.n_molecules
         for comp in self.molfrac:
             self.molfrac[comp] = self.moles[comp] / nmoles
-
         return self
 
     def add_comp(self, comp, number):
@@ -670,12 +672,39 @@ class SAFTVRSystem(System):
     '''
     def __init__(self, temperature=293, pressure=101325, volume=1000):
         super().__init__(temperature, pressure, volume)
+        self.esites = [] # association e type sites in system
+        self.hsites = [] # association h type sites in system
 
         # stored values
         self.hsd = np.array([[None]])
         self.segratio = 0.
         self.segden = 0.
         self.gcomb = np.array([[None]])
+
+    def quick_set(self, *args):
+        super().quick_set(*args)
+        for comp in self.moles: 
+            # quick set resets system to clean state so all not tracked
+            # tracking association sites
+            for site in comp.nsites:
+                if site.site_type == 'e':
+                    self.esites.append((comp, site))
+                else:
+                    self.hsites.append((comp, site))
+
+        return self
+
+    def add_comp(self, comp, number):
+        if comp not in self.moles:
+            for site in comp.nsites:
+                if site.site_type == 'e':
+                    self.esites.append((comp, site))
+                else:
+                    self.hsites.append((comp, site))
+
+        super().add_comp(comp, number)
+
+        return self
 
     def helmholtz(self):
         # calculate stored values
@@ -720,7 +749,7 @@ class SAFTVRSystem(System):
             self.hsd[ci, ci] = comp.hsd(self.temperature) * 1e-10
             for comp2 in self.moles:
                 ci2 = comp2.index
-                if self.hsd[ci, ci2] == 0. and self.hsd[ci2, ci2] != 0.:
+                if (self.hsd[ci, ci2] == 0.) and (self.hsd[ci2, ci2] != 0.):
                     self.hsd[ci, ci2] = (self.hsd[ci,ci] + self.hsd[ci2, ci2]) / 2
                     self.hsd[ci2, ci] = (self.hsd[ci,ci] + self.hsd[ci2, ci2]) / 2
                 #gcomb
@@ -1234,6 +1263,108 @@ class SAFTVRSystem(System):
         return result
 
     # for assoc
+    def __gdhsd(self, hsd1, hsd2):
+        xi2 = self.__xi_m(2) # nm-1
+        xi3 = self.__xi_m(3) # dimless
+
+        t1 = 1/(1-xi3)
+        t2 = 3 * (hsd1 * hsd2) / (hsd1 + hsd2) * xi2 / (1-xi3)**2
+        t3 = 2 * (hsd1 * hsd2)**2 / (hsd1 + hsd2)**2 * xi2**2 / (1-xi3)**3
+
+        gdhsd = t1 + t2 + t3
+
+        return gdhsd
+
+    def __assoc_x(self, tol=1e-6, itmax=30, damper=0.65):
+        # maybe turn off ad here
+        
+        # get deltas 
+        htypes = len(self.hsites)
+        etypes = len(self.esites)
+        deltas = np.zeros((htypes, etypes), dtype=object)
+        for row in range(htypes):
+            (c1, s1) = self.hsites[row]
+            for col in range(etypes):
+                (c2, s2) = self.esites[col]
+                deltas[row, col] = self.__delta_ab(c1.index, c2.index, s1, s2)
+
+        n_sites = htypes + etypes
+        Xia = np.reshape(np.repeat(1, n_sites), (n_sites,1)) # create column vector
+        # indexes: first htypes, then etypes
+        # so for rows: index = row, col: index = htypes + col
+        coeffs = np.zeros((n_sites, n_sites))
+
+        for row in range(htypes):
+            for col in range(etypes):
+                # column corresponds to added stuff so use the index in column to get stuff
+                (h_c, h_s) = self.hsites[row]
+                (e_c, e_s) = self.esites[col]
+
+                coeffs[row, htypes+col] = self.molfrac[e_c]*e_c.nsites[e_s]*deltas[row,col] 
+                coeffs[htypes+col, row] = self.molfrac[h_c]*h_c.nsites[h_s]*deltas[row,col]
+
+        # next_Xia = 1/(1+self.n_den()*coeffs@Xia)
+        count = 0
+        xdiff = Xia - 1/(1+self.n_den()*coeffs@Xia)
+        while np.mean(abs(xdiff)) > tol and count < itmax:
+            f = Xia - 1/(1+self.n_den()*coeffs@Xia)
+            fx = 1/(1+self.n_den()*coeffs@Xia)**2
+            fx = fx*coeffs + np.eye(n_sites)
+
+            jm = np.linalg.inv(fx.T@fx)@fx.T
+
+            next_Xia = Xia - damper * jm@f
+            xdiff = next_Xia - Xia
+            Xia = next_Xia
+            count += 1
+
+        mt.checkwarn(count < itmax, f"Max iteration exceeded when trying to converge mass action equations, average residual {np.mean(abs(xdiff)):0.5e}")
+        return Xia
+
+    def __delta_ab(self, c1i, c2i, s1, s2):
+        # delta is a function of the components and the sites
+
+        fab = s1.calc_fab(s2, self.temperature)
+        kab = s1.get_bondvol(s2) * pow(cst.atom, 3)
+        I = self.__assoc_kern(c1i, c2i)
+        print(fab, kab, I)
+        return fab * kab * I
+
+    def __assoc_kern(self, c1i, c2i, kernel="LJ"):
+        # Assoc kernel only as a function of components here
+        sigx = self.__sigx()
+        rhos = self.segden * sigx**3
+        ts = self.temperature / self.gcomb[c1i, c2i].epsilon
+        if kernel == "LJ":
+            I = 0.
+            for i in range(11):
+                for j in range(11-i):
+                    I += acor.C[i,j] * rhos**i * ts**j
+
+        elif kernel == "Mie":
+            lam = self.gcomb[c1i, c2i].rep
+            I = 0.
+            for i in range(11):
+                for j in range(11-i):
+                    aij = 0.
+                    for k in range(7):
+                        aij += acor.B[i,j,k] * lam
+                    I += aij * rhos**i * ts**j
+
+        return I
+
+    def __sigx(self):
+        result = 0.
+
+        for c1 in self.moles:
+            c1i = c1.index
+            x1 = self.molfrac[c1] * c1.ms / self.segratio
+            for c2 in self.moles:
+                c2i = c2.index
+                x2 = self.molfrac[c2] * c2.ms / self.segratio
+                skl = self.gcomb[c1i, c2i].sigma * cst.atom
+                result += x1 * x2 * pow(skl, 3)
+        return result
 
 class SAFTgMieSystem(System):
     '''
@@ -1858,8 +1989,21 @@ class SAFTgMieSystem(System):
         return result
 
     # for assoc
+    def __sigx(self):
+        result = 0.
+
+        for g1 in self.groups:
+            g1i = g1.index
+            xsk = self.groups[g1] * g1.vk * g1.sf / self.segratio
+            for g2 in self.groups:
+                g2i = g2.index
+                xsl = self.groups[g2] * g2.vk * g2.sf / self.segratio
+                skl = self.gcomb[g1i, g2i].sigma * cst.atom
+                result += xsk * xsl * pow(skl, 3)
+        return result
 
 
+# Group and Component super class
 class MieGroup(object):
     def __init__(self, lambda_r, lambda_a, sigma, epsilon):
         '''
@@ -1951,6 +2095,7 @@ class Component(object):
         cptint = A*log(T) + B*T + (C/2)*T**2 + (D/3)*T**3 - (A*log(tref) + B*tref + (C/2)*tref**2 + (D/3)*tref**3)
         return cptint
 
+# Specific group and component class
 class VRMieComponent(MieGroup, Component):
     '''
     SAFT-VR Mie Component as defined by SAFT-VR Mie Equation-of-state
@@ -1962,9 +2107,76 @@ class VRMieComponent(MieGroup, Component):
         Component.__init__(self, mw)
         self.ms = mspheres
         self.index = VRMieComponent._total
+        self.sites = {}
+        self.nsites = {}
         VRMieComponent._total += 1
         VRMieComponent.add_elem()
         
+    def add_site(self, sitename, site, num):
+        # simple function to just add a site to component
+        mt.checkerr(isinstance(site, AssocSite), "Can only add sites of AssocSite types")
+        mt.checkerr(isinstance(num, int) and num > 0, "Number of sites can only be positive integers")
+        self.sites[sitename] = site
+        self.nsites[site] = num
+
+        return self
+
+    def add_sites(self, no_e, no_h, bv, epsilon):
+        # Basic add_sites: add as many 'e' and 'h' site type. Takes in no. of e sites, no. of h sites,
+        # and the interaction parameters bonding vol and epsilon
+        # bv: A^3, epsilon: K
+        mt.checkerr(isinstance(no_e, (int,list,tuple)), "No. of e type association site must be interger values or list/tuple of integers")
+        mt.checkerr(isinstance(no_h, (int,list,tuple)), "No. of h type association site must be interger values or list/tuple of integers")
+
+        if isinstance(no_e, int):
+            mt.checkerr(no_e > 0, "No. of e type association site must be positive integer")
+            etypes = 1
+        else:
+            mt.checkerr(all((isinstance(i, int) and i >= 1) for i in no_e), "No. of e type association site must be positive integer")
+            etypes = len(no_e)
+
+        if isinstance(no_h, int):
+            mt.checkerr(no_h > 0, "No. of h type association site must be positive integer")
+            htypes = 1
+        else:
+            mt.checkerr(all((isinstance(i, int) and i >= 1) for i in no_h), "No. of h type association site must be positive integer")
+            htypes = len(no_h)
+
+        if etypes == 1 and htypes == 1:
+            mt.checkerr(isinstance(bv, float) and isinstance(epsilon, float), "Use float values for bonding volume and epsilon")
+            hsite = AssocSite('h')
+            esite = AssocSite('e').set_params(hsite, bv, epsilon)
+
+            self.sites['h1'] = hsite
+            self.nsites[hsite] = no_e
+            self.sites['e1'] = esite
+            self.nsites[esite] = no_h
+
+        else:
+            mt.checkerr(isinstance(bv, np.ndarray) and isinstance(epsilon, np.ndarray), "Use numpy array of float values for bonding volume and epsilon")
+            mt.checkerr(bv.shape == (htypes, etypes), "For multiple site types, bonding volume numpy array size must correspond to (no. of h types, no. of e types)")
+            mt.checkerr(epsilon.shape == (htypes, etypes), "For multiple site types, epsilon numpy array size must correspond to (no. of h types, no. of e types)")
+
+            for col in range(etypes):
+                esite = AssocSite('e')
+                self.sites['e'+str(col+1)] = esite
+                if etypes > 1:
+                    self.nsites[esite] = no_e[col]
+                else:
+                    self.nsites[esite] = no_e
+
+            ecol = lambda col: self.sites['e'+str(col+1)]
+            for row in range(htypes):
+                hsite = AssocSite('h')
+                self.sites['h'+str(row+1)] = hsite
+                if htypes > 1:
+                    self.nsites[hsite] = no_h[col]
+                else:
+                    self.nsites[hsite] = no_h
+                for col in range(etypes):
+                    hsite.set_params(ecol(col), bv[row,col], epsilon[row,col])
+        return self
+
     def __repr__(self):
         return "VR-Mie: {:5.3f} spheres of ".format(self.ms) + super().__repr__()
 
@@ -2100,9 +2312,229 @@ class VRMieComponent(MieGroup, Component):
 
         return gij
 
-# class AssocSite(object):
-#     _rc_table = np.array([[0.]])
-#     def __init__(self):
+class AssocSite(object):
+    _etotal = 0
+    _htotal = 0
+    _etable = np.array([[0.]]) # epsilon cross interactions: units K
+    _vtable = np.array([[0.]]) # bonding volume cross interactions: units A
+    def __init__(self, site_type='e'):
+        # site type is either 'e' or 'h' to distinguish between receiver and donor
+        mt.checkerr(site_type.lower() == 'e' or site_type.lower() == 'h', "site_type option unknown")
+        self.site_type = site_type.lower()
+
+        if self.site_type == 'e':
+            # add a column for e
+            self.index = AssocSite._etotal
+            AssocSite._etotal += 1
+            if AssocSite._etotal > 1:
+                t = AssocSite._etable
+                AssocSite._etable = np.append(t, np.zeros((t.shape[0], 1)), axis=1)
+                t2 = AssocSite._vtable
+                AssocSite._vtable = np.append(t2, np.zeros((t2.shape[0], 1)), axis=1)
+        else: 
+            # add a row for h
+            self.index = AssocSite._htotal
+            AssocSite._htotal += 1
+            if AssocSite._htotal > 1:
+                t = AssocSite._etable
+                AssocSite._etable = np.append(t, np.zeros((1, t.shape[1])), axis=0)
+                t2 = AssocSite._vtable
+                AssocSite._vtable = np.append(t2, np.zeros((1 ,t2.shape[1])), axis=0)
+
+    @classmethod
+    def n_total(cls):
+        return (cls._etotal, cls._htotal)
+
+    def __add__(self, other):
+        # Association combining rules
+        # there's no use of combining undefined interactions, so this part
+        # we will just look up the table, else return 0s
+        mt.checkerr(isinstance(other, AssocSite), "AssocSite can only have interaction parameters with other AssocSite")
+        if self.site_type == 'e':
+            i1 = other.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = other.index
+
+        bondvol = AssocSite._vtable[i1,i2]
+        epsi = AssocSite._etable[i1,i2]
+
+        return (bondvol, epsi)
+
+    def __repr__(self):
+        return 'AssocSite \'{:s}{:02d}\''.format(self.site_type, self.index+1)
+
+    def get_bondvol(self, other):
+        mt.checkerr(isinstance(other, AssocSite), "AssocSite can only have interaction parameters with other AssocSite")
+        if self.site_type == 'e':
+            i1 = other.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = other.index
+
+        bondvol = AssocSite._vtable[i1,i2]
+        return bondvol
+    
+    @classmethod
+    def get_bv(cls, s1, s2):
+        mt.checkerr(isinstance(s1, AssocSite) and isinstance(s2, AssocSite), "AssocSite parameters can be retrieved by AssocSite inputs")
+        if s1.site_type == 'e':
+            i1 = s2.index
+            i2 = s1.index
+        else:
+            i1 = s1.index
+            i2 = s2.index
+
+        bondvol = cls._vtable[i1, i2]
+        return bondvol
+
+    def get_epsi(self, other):
+        mt.checkerr(isinstance(other, AssocSite), "AssocSite can only have interaction parameters with other AssocSite")
+        if self.site_type == 'e':
+            i1 = other.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = other.index
+
+        epsi = AssocSite._etable[i1,i2]
+        return epsi
+
+    @classmethod
+    def get_e(cls, s1, s2):
+        mt.checkerr(isinstance(s1, AssocSite) and isinstance(s2, AssocSite), "AssocSite parameters can be retrieved by AssocSite inputs")
+        if s1.site_type == 'e':
+            i1 = s2.index
+            i2 = s1.index
+        else:
+            i1 = s1.index
+            i2 = s2.index
+
+        epsi = cls._etable[i1, i2]
+        return epsi
+
+    def get_params(self, other):
+        return self + other
+
+    @classmethod
+    def get_bv_e(cls, s1, s2):
+        mt.checkerr(isinstance(s1, AssocSite) and isinstance(s2, AssocSite), "Get parameters between 2 AssocSites only")
+        return s1 + s2
+
+    @classmethod
+    def print_table(cls):
+        print("{:30s}{:d} 'e', {:d} 'a/h'".format("Total Association Sites: ", cls._etotal, cls._htotal))
+        print("{:40s}".format("With 'e' as columns and 'a/h' as rows"))
+        print("{:40s}".format("Bonding volume (m3) table:"))
+        print(cls._vtable)
+        print("{:40s}".format("Interaction energy (J) table:"))
+        print(cls._etable)
+
+    @classmethod
+    def set_bv(cls, s1, s2, val):
+        mt.checkerr(isinstance(s1, AssocSite) and isinstance(s2, AssocSite), "Set cross interactions between same class only")
+        mt.checkerr(s1.site_type != s2.site_type, "Association cross interactions must be of different site types")
+        if s1.site_type == 'e':
+            i1 = s2.index
+            i2 = s1.index
+        else:
+            i1 = s1.index
+            i2 = s2.index
+
+        cls._vtable[i1,i2] = val
+
+    @classmethod
+    def set_e(cls, s1, s2, val):
+        mt.checkerr(isinstance(s1, AssocSite) and isinstance(s2, AssocSite), "Set cross interactions between same class only")
+        mt.checkerr(s1.site_type != s2.site_type, "Association cross interactions must be of different site types")
+        if s1.site_type == 'e':
+            i1 = s2.index
+            i2 = s1.index
+        else:
+            i1 = s1.index
+            i2 = s2.index
+
+        cls._etable[i1,i2] = val
+
+    @classmethod
+    def set_bv_e(cls, s1, s2, bv, epsi):
+        mt.checkerr(isinstance(s1, AssocSite) and isinstance(s2, AssocSite), "Set cross interactions between same class only")
+        mt.checkerr(s1.site_type != s2.site_type, "Association cross interactions must be of different site types")
+        if s1.site_type == 'e':
+            i1 = s2.index
+            i2 = s1.index
+        else:
+            i1 = s1.index
+            i2 = s2.index
+
+        cls._vtable[i1,i2] = bv
+        cls._etable[i1,i2] = epsi
+
+    def set_bondvol(self, s, val):
+        mt.checkerr(isinstance(s, AssocSite), "Set cross interactions between same class only")
+        mt.checkerr(self.site_type != s.site_type, "Association cross interactions must be of different site types")
+        if self.site_type == 'e':
+            i1 = s.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = s.index
+
+        AssocSite._vtable[i1,i2] = val
+
+        return self
+
+    def set_epsi(self, s, val):
+        mt.checkerr(isinstance(s, AssocSite), "Set cross interactions between same class only")
+        mt.checkerr(self.site_type != s.site_type, "Association cross interactions must be of different site types")
+        if self.site_type == 'e':
+            i1 = s.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = s.index
+
+        AssocSite._etable[i1,i2] = val
+
+        return self
+
+    def set_params(self, s, bv, epsi):
+        mt.checkerr(isinstance(s, AssocSite), "Set cross interactions between same class only")
+        mt.checkerr(self.site_type != s.site_type, "Association cross interactions must be of different site types")
+        if self.site_type == 'e':
+            i1 = s.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = s.index
+
+        AssocSite._vtable[i1,i2] = bv
+        AssocSite._etable[i1,i2] = epsi
+
+        return self
+
+    @classmethod
+    def fab(cls, s1, s2, temp):
+        if s1.site_type == 'e':
+            i1 = s2.index
+            i2 = s1.index
+        else:
+            i1 = s1.index
+            i2 = s2.index
+        epsi = cls._etable[i1, i2] # unit K
+        return exp(epsi/temp) - 1
+
+    def calc_fab(self, s, temp):
+        if self.site_type == 'e':
+            i1 = s.index
+            i2 = self.index
+        else:
+            i1 = self.index
+            i2 = s.index
+        epsi = AssocSite._etable[i1,i2]
+        return exp(epsi/temp) - 1
 
 class GMieGroup(MieGroup):
     '''
@@ -2429,6 +2861,7 @@ def main():
     vrc['carbon dioxide'] =         VRMieComponent(1.5000,  44.01, 27.557, 5.1646, 3.1916, 231.88)
     vrc['benzene'] =                VRMieComponent(1.9163,  78.11, 14.798,      6, 4.0549, 372.59)
     vrc['toluene'] =                VRMieComponent(1.9977,  92.14, 16.334,      6, 4.2777, 409.73)
+    # testing = VRMieComponent(6,  92.14, 6.96, 6, 3.8, 253.5)
     vrc['ethane'].set_cross_e_kij(vrc['n-decane'], -0.0222)
     vrc['carbon dioxide'].set_cross_e_kij(vrc['n-decane'], 0.0500)
 
@@ -2544,6 +2977,7 @@ def main():
     print('{:18s}'.format('gmieij'),s._SAFTgMieSystem__gmieij(c4.index))
     print('{:18s}'.format('a_chain'),s.a_chain())
     print('{:18s}'.format('helmholtz'),s.helmholtz())
+
     # print('{:18s}'.format('d a_ideal dV'),derivative(s.helmholtz_ideal(), s.volume))
     # print('{:18s}'.format('d a_res dV'),derivative(s.helmholtz_residual(), s.volume))
     print('='*20)
@@ -2556,28 +2990,58 @@ def main():
     print('{:25s}{:8.3f}'.format('critical P (bar)', pc*cst.patobar))
     print('{:25s}{:8.3f}'.format('critical T (K)', tc))
     print('{:25s}{:8.3f}'.format('critical rho (mol/m3)', rhoc*1e-3*vrc['SF6'].mw))
-    vget = s.single_phase_v(15e6, 550, print_results=False, v_crit=1/rhoc, supercritical=True)
-    print('{:25s}{:8.3f}'.format('sp_v (1e-3 m3/mol)', vget * 1e3))
-    print('{:25s}{:8.3f}'.format('rho (kg/m3)',1/vget*1e-3*vrc['SF6'].mw))
-    s.set_molar_volume(vget)
+    # vget = s.single_phase_v(15e6, 550, print_results=False, v_crit=1/rhoc, supercritical=True)
+    # print('{:25s}{:8.3f}'.format('sp_v (1e-3 m3/mol)', vget * 1e3))
+    # print('{:25s}{:8.3f}'.format('rho (kg/m3)',1/vget*1e-3*vrc['SF6'].mw))
+    # s.set_molar_volume(vget)
     s.temperature = 550
-    print('{:25s}{:8.3f}'.format('get_pressure (MPa)',s.get_pressure()*1e-6))
-    print('{:25s}{:8.3f}'.format('get_entropy (J/mol K)',s.get_entropy()))
-    print('{:25s}{:8.3f}'.format('get_u (J/mol)',s.get_u()))
-    print('{:25s}{:8.3f}'.format('get_enthalpy (J/mol)',s.get_enthalpy()))
-    print('{:25s}{:8.3f}'.format('get_gibbs (J/mol)',s.get_gibbs()))
-    print('{:25s}{:8.3f}'.format('get_cv (J/mol K)',s.get_cv()))
-    print('{:25s}{:8.3f}'.format('get_kappa (1/MPa)',s.get_kappa() * 1e6))
-    print('{:25s}{:8.3f}'.format('get_cp (J/mol K)',s.get_cp()))
-    print('{:25s}{:8.3f}'.format('get_cp (kJ/kg K)',s.get_cp()/vrc['SF6'].mw))
-    print('{:25s}{:8.3f}'.format('get_w (m/s)',s.get_w()))  
-    print('{:25s}{:8.3f}'.format('get_jt (K/MPa)',s.get_jt() *1e6))
-    print('{:25s}'.format('dv2'),s.dV2(), s.n_molecules * cst.k * s.temperature / s.volume**2 + s.dV2(a='res'))
-    print('{:25s}'.format('dt2'),s.dT2())
-    print('{:25s}'.format('dtdv'),s.dTdV())
-    xa = s.dTdV(a='res')
-    print('{:25s}'.format('dtdv'), -s.n_molecules * cst.k / s.volume + xa[1])
+    # print('{:25s}{:8.3f}'.format('get_pressure (MPa)',s.get_pressure()*1e-6))
+    # print('{:25s}{:8.3f}'.format('get_entropy (J/mol K)',s.get_entropy()))
+    # print('{:25s}{:8.3f}'.format('get_u (J/mol)',s.get_u()))
+    # print('{:25s}{:8.3f}'.format('get_enthalpy (J/mol)',s.get_enthalpy()))
+    # print('{:25s}{:8.3f}'.format('get_gibbs (J/mol)',s.get_gibbs()))
+    # print('{:25s}{:8.3f}'.format('get_cv (J/mol K)',s.get_cv()))
+    # print('{:25s}{:8.3f}'.format('get_kappa (1/MPa)',s.get_kappa() * 1e6))
+    # print('{:25s}{:8.3f}'.format('get_cp (J/mol K)',s.get_cp()))
+    # print('{:25s}{:8.3f}'.format('get_cp (kJ/kg K)',s.get_cp()/vrc['SF6'].mw))
+    # print('{:25s}{:8.3f}'.format('get_w (m/s)',s.get_w()))  
+    # print('{:25s}{:8.3f}'.format('get_jt (K/MPa)',s.get_jt() *1e6))
+    # print('{:25s}'.format('dv2'),s.dV2(), s.n_molecules * cst.k * s.temperature / s.volume**2 + s.dV2(a='res'))
+    # print('{:25s}'.format('dt2'),s.dT2())
+    # print('{:25s}'.format('dtdv'),s.dTdV())
+    # xa = s.dTdV(a='res')
+    # print('{:25s}'.format('dtdv'), -s.n_molecules * cst.k / s.volume + xa[1])
+    print('='*20)
+    print('Testing assoc with SAFTVR')
+    print('='*20)
+    
+    vr_methanol = VRMieComponent(1.7989,  32.04, 16.968,     6., 3.1425, 276.92)
+    vr_ammonia  = VRMieComponent(     1, 17.031, 36.832,     6., 3.3309, 323.70)
+    vr_h2s      = VRMieComponent(     1,  34.10, 31.311,     6., 3.7820, 243.28)
+    vr_co2      = VRMieComponent(1.5000,  44.01, 27.557, 5.1646, 3.1916, 231.88)
+    vr_test     = VRMieComponent(     3,  58.08, 17.443,     6., 3.5980, 286.02)
 
+    vr_co2.add_site('a1', AssocSite('h'), 1)
+    vr_methanol.add_sites(2,1,222.18,2156.0)
+    vr_ammonia.add_sites(1,3,560.73,1105.0)
+    vr_h2s.add_sites(2,2,1880.4,585.72)
+    vr_test.add_sites((1,1), 1, np.array([[2865.2, 1250.3]]), np.array([[980.2, 1150.9]]))
+
+    AssocSite.print_table()
+
+    print('{:18s}'.format('testing get_bondvol'),vr_h2s.sites['e1'].get_bondvol(vr_h2s.sites['h1']))
+    print('{:18s}'.format('testing get_bv_e'), AssocSite.get_bv_e(vr_h2s.sites['e1'],vr_h2s.sites['h1']))
+    print('{:18s}'.format('testing fab'), AssocSite.fab(vr_h2s.sites['e1'], vr_h2s.sites['h1'], 300.))
+    print('{:18s}'.format('testing calc_fab'), vr_h2s.sites['e1'].calc_fab(vr_h2s.sites['h1'], 300.))
+    st = SAFTVRSystem().quick_set((vr_test, 100), (vr_h2s, 100))
+    print('{:18s}'.format('asites added'), vr_test.nsites, vr_h2s.nsites)
+    print('{:18s}'.format('system esites'), st.esites)
+    print('{:18s}'.format('system hsites'), st.hsites)
+
+    st.helmholtz()
+    print(st._SAFTVRSystem__assoc_x())
+
+    '''
     print('='*20)
     print('Testing get properties with SAFTgMie')
     print('='*20)
@@ -2595,6 +3059,8 @@ def main():
     print(nbutane.cp_int(300), nbutane.cp_t_int(300))
     print(npentane.cp_int(300), npentane.cp_t_int(300))
 
+    # st = SAFTVRSystem().quick_set((testing, 100))
+    # (pc,tc,rhoc) = st.critical_point(initial_t=500, v_nd=np.logspace(-3,-1,50), get_volume=False, get_density=True,print_results=False, print_progress=True)
     # C5 speed of sound
     # (pc, tc, rhoc) = C5s.critical_point(initial_t=480., v_nd=np.logspace(-4,-1,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
     # print(pc, tc, 1/rhoc)
@@ -2627,20 +3093,20 @@ def main():
     # plt.show()
 
     # C10 Cp
-    (pc, tc, rhoc) = C10s.critical_point(initial_t=380., v_nd=np.logspace(-3.5,-0.5,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
-    print(pc, tc, 1/rhoc)
-    trange = np.linspace(500,700,15)
-    vget = np.zeros(15)
-    cp = np.zeros(15)
-    for i in range(len(trange)):
-        t = trange[i]
-        vget[i] = C10s.single_phase_v(3e6, t, print_results=False, v_crit=1/rhoc, v_init=0.3/rhoc, supercritical=True)
-        cp[i] = C10s.get_cp(temperature=t, molar_volume=vget[i])
-    fig, ax = plt.subplots()
-    ax.plot(trange, cp, 'bo')
-    print(cp)
-    plt.show()
-
+    # (pc, tc, rhoc) = C10s.critical_point(initial_t=380., v_nd=np.logspace(-3.5,-0.5,50), get_volume=False, get_density=True, print_results=False, print_progress=False)
+    # print(pc, tc, 1/rhoc)
+    # trange = np.linspace(500,700,15)
+    # vget = np.zeros(15)
+    # cp = np.zeros(15)
+    # for i in range(len(trange)):
+    #     t = trange[i]
+    #     vget[i] = C10s.single_phase_v(3e6, t, print_results=False, v_crit=1/rhoc, v_init=0.3/rhoc, supercritical=True)
+    #     cp[i] = C10s.get_cp(temperature=t, molar_volume=vget[i])
+    # fig, ax = plt.subplots()
+    # ax.plot(trange, cp, 'bo')
+    # print(cp)
+    # plt.show()
+    '''
     '''
     comps = {}
     puresys = {}
