@@ -1131,7 +1131,7 @@ class SAFTVRSystem(System):
         t13 = 3 * (1-xix/2) / (1-xix) - 1/2
         t1 = t11 + t12 * t13
 
-        t21 = 1 + pow(xix,2)
+        t21 = xix + pow(xix,2)
         t22 = segden*derxix
         t23 = 1 + 2 * xix + 3 * xix * (1+xix) / (1-xix) 
         t2 = 9/2 * (t21 + t22 * t23)
@@ -2790,13 +2790,13 @@ class GMieComponent(Component):
                 if isinstance(hsd, np.ndarray):
                     g1i = g1.index
                     g2i = g2.index
-                    hsdii += zki * zli * hsd[g1i, g2i]
+                    hsdii += zki * zli * pow(hsd[g1i, g2i],3)
 
         mg = MieGroup(rep, att, sig3**(1/3), epsi)
 
         if not isinstance(hsd, np.ndarray):
             return mg
-        return (mg, hsdii)
+        return (mg, pow(hsdii,1/3))
 
     def cp_int(self, T):
         if self.cp is None:
