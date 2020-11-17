@@ -1860,7 +1860,7 @@ class SAFTgMieSystem(System):
         t13 = 3 * (1-xix/2) / (1-xix) - 1/2
         t1 = t11 + t12 * t13
 
-        t21 = 1 + pow(xix,2)
+        t21 = xix + pow(xix,2)
         t22 = segden*derxix
         t23 = 1 + 2 * xix + 3 * xix * (1+xix) / (1-xix) 
         t2 = 9/2 * (t21 + t22 * t23)
