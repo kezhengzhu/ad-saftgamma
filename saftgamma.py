@@ -68,6 +68,44 @@ class System(object):
         return self
 
     # Get derivatives #################
+    def dN(self, key=None, a='both'):
+        # key corresponds to the component that you want to get chemical potential for.
+        # if key = a list or tuple of keys, it will generate the list of corresponding dN
+        # if key = None, it will return all components
+        Var.set_order(1)
+        N = self.moles.copy()
+        if key is None:
+            for comp in self.moles:
+                self.moles[comp] = Var(self.moles[comp])
+        elif isinstance(key, (list,tuple)):
+            for comp in key:
+                assert(comp in self.moles)
+
+            for comp in key:
+                self.moles[comp] = Var(self.moles[comp])
+        else:
+            assert(key in self.moles)
+            self.moles[key] = Var(self.moles[key])
+        self.n_molecules = sum(self.moles.values())
+
+        fn = 0
+        if a == 'res':
+            fn = self.helmholtz_residual()
+        elif a == 'ideal' or a == 'id':
+            fn = self.helmholtz_ideal()
+        else:
+            fn = self.helmholtz()
+
+        if key is None:
+            da = derivative(fn, *self.moles.values()) 
+        elif isinstance(key, (list,tuple)):
+            da = derivative(fn, *[self.moles[k] for k in key])
+        else:
+            da = derivative(fn, self.moles[key])
+
+        self.moles = N
+        self.n_molecules = sum(self.moles.values())
+        return da
 
     def dT(self, a='both'):
         Var.set_order(1)
